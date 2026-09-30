@@ -115,6 +115,15 @@ typedef struct ext4_dir {
  * @param   dev_name Block device name.
  *
  * @return  Standard error code.*/
+/**@brief   Give lwext4 a wall clock for inode timestamps.
+ * @param   clock seconds since the epoch; NULL (the default) leaves
+ *          timestamps untouched.
+ * With a clock, creating an entry stamps the new inode's atime, mtime and
+ * ctime and the parent's mtime and ctime; unlinking stamps the parent's mtime
+ * and ctime and the inode's ctime; writing and truncating stamp mtime and
+ * ctime.*/
+void ext4_set_clock(uint32_t (*clock)(void));
+
 int ext4_device_register(struct ext4_blockdev *bd,
 			 const char *dev_name);
 

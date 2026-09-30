@@ -822,6 +822,15 @@ struct jbd_sb {
 
 #if CONFIG_USE_USER_MALLOC
 
+#include <stddef.h>
+
+/* Supplied by the application: the four entry points every allocation in
+ * lwext4 goes through when CONFIG_USE_USER_MALLOC is set. */
+void *ext4_user_malloc(size_t size);
+void *ext4_user_calloc(size_t count, size_t size);
+void *ext4_user_realloc(void *pointer, size_t size);
+void ext4_user_free(void *pointer);
+
 #define ext4_malloc  ext4_user_malloc
 #define ext4_calloc  ext4_user_calloc
 #define ext4_realloc ext4_user_realloc

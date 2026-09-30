@@ -214,9 +214,55 @@ static int ext4_has_children(bool *has_children, struct ext4_inode_ref *enode)
 	return EOK;
 }
 
+/**@brief Wall clock for inode timestamps, seconds since the epoch.
+ *        NULL (the default) leaves every timestamp alone, as lwext4
+ *        always did. Set with ext4_set_clock.*/
+static uint32_t (*ext4_clock)(void);
+
+void ext4_set_clock(uint32_t (*clock)(void))
+{
+	ext4_clock = clock;
+}
+
+/**@brief Stamp an inode that just changed: ctime always, mtime when its
+ *        contents (data, or entries for a directory) did too.*/
+static void ext4_stamp(struct ext4_inode_ref *ref, bool modified)
+{
+	if (!ext4_clock)
+		return;
+	uint32_t now = ext4_clock();
+	if (modified)
+		ext4_inode_set_modif_time(ref->inode, now);
+	ext4_inode_set_change_inode_time(ref->inode, now);
+	ref->dirty = true;
+}
+
+static int ext4_link_entries(struct ext4_mountpoint *mp,
+			     struct ext4_inode_ref *parent,
+			     struct ext4_inode_ref *ch, const char *n,
+			     uint32_t len, bool rename);
+
 static int ext4_link(struct ext4_mountpoint *mp, struct ext4_inode_ref *parent,
 		     struct ext4_inode_ref *ch, const char *n,
 		     uint32_t len, bool rename)
+{
+	/* A fresh inode has no links yet: it is being created, and all three
+	 * of its times start now. */
+	bool created = !rename && ext4_inode_get_links_cnt(ch->inode) == 0;
+	int r = ext4_link_entries(mp, parent, ch, n, len, rename);
+	if (r != EOK)
+		return r;
+	ext4_stamp(parent, true);
+	ext4_stamp(ch, created);
+	if (created && ext4_clock)
+		ext4_inode_set_access_time(ch->inode, ext4_clock());
+	return EOK;
+}
+
+static int ext4_link_entries(struct ext4_mountpoint *mp,
+			     struct ext4_inode_ref *parent,
+			     struct ext4_inode_ref *ch, const char *n,
+			     uint32_t len, bool rename)
 {
 	/* Check maximum name length */
 	if (len > EXT4_DIRECTORY_FILENAME_LEN)
@@ -335,21 +381,8 @@ static int ext4_unlink(struct ext4_mountpoint *mp,
 		parent->dirty = true;
 	}
 
-	/*
-	 * TODO: Update timestamps of the parent
-	 * (when we have wall-clock time).
-	 *
-	 * ext4_inode_set_change_inode_time(parent->inode, (uint32_t) now);
-	 * ext4_inode_set_modification_time(parent->inode, (uint32_t) now);
-	 * parent->dirty = true;
-	 */
-
-	/*
-	 * TODO: Update timestamp for inode.
-	 *
-	 * ext4_inode_set_change_inode_time(child->inode,
-	 *     (uint32_t) now);
-	 */
+	ext4_stamp(parent, true);
+	ext4_stamp(child, false);
 	if (ext4_inode_get_links_cnt(child->inode)) {
 		ext4_fs_inode_links_count_dec(child);
 		child->dirty = true;
@@ -1628,6 +1661,7 @@ static int ext4_ftruncate_no_lock(ext4_file *file, uint64_t size)
 	r = ext4_trunc_inode(file->mp, ref.index, size);
 	if (r != EOK)
 		goto Finish;
+	ext4_stamp(&ref, true);
 
 	file->fsize = size;
 	if (file->fpos > size)
@@ -2004,6 +2038,7 @@ out_fsize:
 		ext4_inode_set_size(ref.inode, file->fsize);
 		ref.dirty = true;
 	}
+	ext4_stamp(&ref, true);
 
 Finish:
 	r = ext4_fs_put_inode_ref(&ref);
@@ -2654,6 +2689,7 @@ Finish:
 	return r;
 }
 
+#if CONFIG_XATTR_ENABLE
 int ext4_setxattr(const char *path, const char *name, size_t name_len,
 		  const void *data, size_t data_size)
 {
@@ -2880,6 +2916,39 @@ Finish:
 	return r;
 
 }
+
+#else /* !CONFIG_XATTR_ENABLE */
+
+/* Built without extended attributes (ext4_xattr.c compiles to nothing): the
+ * API stays, and says so. */
+int ext4_setxattr(const char *path, const char *name, size_t name_len,
+		  const void *data, size_t data_size)
+{
+	(void)path; (void)name; (void)name_len; (void)data; (void)data_size;
+	return ENOTSUP;
+}
+
+int ext4_getxattr(const char *path, const char *name, size_t name_len,
+		  void *buf, size_t buf_size, size_t *data_size)
+{
+	(void)path; (void)name; (void)name_len; (void)buf; (void)buf_size;
+	(void)data_size;
+	return ENOTSUP;
+}
+
+int ext4_listxattr(const char *path, char *list, size_t size, size_t *ret_size)
+{
+	(void)path; (void)list; (void)size; (void)ret_size;
+	return ENOTSUP;
+}
+
+int ext4_removexattr(const char *path, const char *name, size_t name_len)
+{
+	(void)path; (void)name; (void)name_len;
+	return ENOTSUP;
+}
+
+#endif /* CONFIG_XATTR_ENABLE */
 
 /*********************************DIRECTORY OPERATION************************/
 

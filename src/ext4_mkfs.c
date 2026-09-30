@@ -116,6 +116,11 @@ static uint32_t compute_inodes_per_group(struct ext4_mkfs_info *info)
 	uint32_t block_groups = EXT4_DIV_ROUND_UP(blocks, info->blocks_per_group);
 	uint32_t inodes = EXT4_DIV_ROUND_UP(info->inodes, block_groups);
 	inodes = EXT4_ALIGN(inodes, (info->block_size / info->inode_size));
+	/* Whole bytes of the inode bitmap, as mke2fs does: a count that is not
+	 * a multiple of 8 leaves padding bits in the last byte that e2fsck wants
+	 * set ("Padding at end of inode bitmap is not set"), and nothing here
+	 * sets them. */
+	inodes = EXT4_ALIGN(inodes, 8);
 
 	/* After properly rounding up the number of inodes/group,
 	 * make sure to update the total inodes field in the info struct.
@@ -359,14 +364,22 @@ static int write_bgroups(struct ext4_blockdev *bd, struct fs_aux_info *aux_info,
 		uint32_t blk_off = 0;
 
 		bg_desc = (void *)(aux_info->bg_desc_blk + k * dsc_size);
-		bg_free_blk = info->blocks_per_group -
-				aux_info->inode_table_blocks;
+
+		/* The blocks this group really has: the last one is usually
+		 * short. Counting it as a full group gave it free blocks past
+		 * the end of the volume (e2fsck: "Free blocks count wrong").
+		 * Blocks before first_data_block belong to no group. */
+		uint64_t group_first = (uint64_t)i * info->blocks_per_group;
+		uint64_t in_groups = aux_info->len_blocks -
+				     aux_info->first_data_block;
+		uint32_t group_blocks = info->blocks_per_group;
+		if (in_groups - group_first < group_blocks)
+			group_blocks = (uint32_t)(in_groups - group_first);
+
+		bg_free_blk = group_blocks - aux_info->inode_table_blocks;
 
 		bg_free_blk -= 2;
 		blk_off += aux_info->bg_desc_blocks;
-
-		if (i == (aux_info->groups - 1))
-			bg_free_blk -= aux_info->first_data_block;
 
 		if (has_superblock(info, i)) {
 			bg_start_block++;
@@ -852,6 +865,9 @@ int ext4_mkfs(struct ext4_fs *fs, struct ext4_blockdev *bd,
 
 	cache_fini:
 	ext4_block_cache_write_back(bd, 0);
+	/* Free the cached blocks, as ext4_umount does: without this every
+	 * mkfs leaked the whole cache (CONFIG_BLOCK_DEV_CACHE_SIZE blocks). */
+	ext4_bcache_cleanup(&bc);
 	ext4_bcache_fini_dynamic(&bc);
 
 	block_fini:
