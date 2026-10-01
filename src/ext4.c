@@ -112,6 +112,8 @@ static struct ext4_block_devices s_bdevices[CONFIG_EXT4_BLOCKDEVS_COUNT];
 /**@brief   Mountpoints.*/
 static struct ext4_mountpoint s_mp[CONFIG_EXT4_MOUNTPOINTS_COUNT];
 
+static void ext4_dir_cache_drop(void);
+
 int ext4_device_register(struct ext4_blockdev *bd,
 			 const char *dev_name)
 {
@@ -402,6 +404,8 @@ int ext4_mount(const char *dev_name, const char *mount_point,
 	struct ext4_blockdev *bd = 0;
 	struct ext4_mountpoint *mp = 0;
 
+	ext4_dir_cache_drop();
+
 	ext4_assert(mount_point && dev_name);
 
 	size_t mp_len = strlen(mount_point);
@@ -479,6 +483,8 @@ int ext4_umount(const char *mount_point)
 	int i;
 	int r;
 	struct ext4_mountpoint *mp = 0;
+
+	ext4_dir_cache_drop();
 
 	for (i = 0; i < CONFIG_EXT4_MOUNTPOINTS_COUNT; ++i) {
 		if (!strcmp(s_mp[i].name, mount_point)) {
@@ -736,6 +742,7 @@ static int ext4_trans_stop(struct ext4_mountpoint *mp __unused)
 
 static void ext4_trans_abort(struct ext4_mountpoint *mp __unused)
 {
+	ext4_dir_cache_drop();
 #if CONFIG_JOURNALING_ENABLE
 	__ext4_trans_abort(mp);
 #endif
@@ -954,6 +961,55 @@ static int ext4_trunc_dir(struct ext4_mountpoint *mp,
 }
 
 /*
+ * The directory the last path walk ended in, so the next walk into the same
+ * directory starts there instead of at the root.  Creating or opening a run
+ * of files in one directory -- unpacking a tree, a compiler reading headers --
+ * otherwise re-reads every directory on the way down for every file: three
+ * blocks a level (inode table, index root, leaf), more than the block cache
+ * holds for any deep path, so none of it is ever a hit.
+ *
+ * A directory keeps its inode until it is removed or renamed, so the entry is
+ * dropped by everything that removes, renames or rolls back, and by mount and
+ * umount.  Keyed by the literal path text after the mount point.
+ */
+static struct {
+	struct ext4_mountpoint *mp;
+	uint32_t inode;
+	uint32_t len;
+	char path[120];
+} s_dir_cache;
+
+static void ext4_dir_cache_drop(void)
+{
+	s_dir_cache.mp = NULL;
+}
+
+static void ext4_dir_cache_set(struct ext4_mountpoint *mp, const char *path,
+			       uint32_t len, uint32_t inode)
+{
+	if (len >= sizeof(s_dir_cache.path)) {
+		ext4_dir_cache_drop();
+		return;
+	}
+	memcpy(s_dir_cache.path, path, len);
+	s_dir_cache.len = len;
+	s_dir_cache.inode = inode;
+	s_dir_cache.mp = mp;
+}
+
+/* Length of the cached directory prefix of *path* ("a/b" of "a/b/c"), or 0. */
+static uint32_t ext4_dir_cache_match(struct ext4_mountpoint *mp,
+				     const char *path)
+{
+	uint32_t len = s_dir_cache.len;
+
+	if (s_dir_cache.mp != mp || strncmp(path, s_dir_cache.path, len) != 0 ||
+	    path[len] != '/' || !path[len + 1])
+		return 0;
+	return len;
+}
+
+/*
  * NOTICE: if filetype is equal to EXT4_DIRENTRY_UNKNOWN,
  * any filetype of the target dir entry will be accepted.
  */
@@ -990,13 +1046,23 @@ static int ext4_generic_open2(ext4_file *f, const char *path, int flags,
 	if (name_off)
 		*name_off = strlen(mp->name);
 
-	/*Load root*/
-	r = ext4_fs_get_inode_ref(fs, EXT4_INODE_ROOT_INDEX, &ref);
+	const char *const walk_start = path;
+	uint32_t cached = ext4_dir_cache_match(mp, path);
+
+	/*Load root -- or the directory the last walk ended in*/
+	r = ext4_fs_get_inode_ref(fs, cached ? s_dir_cache.inode
+					     : EXT4_INODE_ROOT_INDEX, &ref);
 	if (r != EOK)
 		return r;
 
 	if (parent_inode)
 		*parent_inode = ref.index;
+
+	if (cached) {
+		path += cached + 1;
+		if (name_off)
+			*name_off += cached + 1;
+	}
 
 	len = ext4_path_check(path, &is_goal);
 	while (1) {
@@ -1099,6 +1165,13 @@ static int ext4_generic_open2(ext4_file *f, const char *path, int flags,
 
 		if (name_off)
 			*name_off += len + 1;
+
+		/* *ref* is a directory; remember it once only the last
+		   component is left. */
+		if (*path && !strchr(path, '/'))
+			ext4_dir_cache_set(mp, walk_start,
+					   (uint32_t)(path - 1 - walk_start),
+					   ref.index);
 	}
 
 	if (r != EOK) {
@@ -1360,7 +1433,7 @@ Finish:
 
 }
 
-int ext4_frename(const char *path, const char *new_path)
+static int __ext4_frename(const char *path, const char *new_path)
 {
 	int r;
 	ext4_file f;
@@ -1428,6 +1501,18 @@ Finish:
 
 }
 
+/* Removing or renaming can retire a directory inode the walk cache points at,
+   and the walks inside can cache one about to go: drop it on both sides. */
+int ext4_frename(const char *path, const char *new_path)
+{
+	int r;
+
+	ext4_dir_cache_drop();
+	r = __ext4_frename(path, new_path);
+	ext4_dir_cache_drop();
+	return r;
+}
+
 /****************************************************************************/
 
 int ext4_get_sblock(const char *mount_point, struct ext4_sblock **sb)
@@ -1469,7 +1554,7 @@ int ext4_cache_flush(const char *path)
 	return ret;
 }
 
-int ext4_fremove(const char *path)
+static int __ext4_fremove(const char *path)
 {
 	ext4_file f;
 	uint32_t parent_inode;
@@ -1569,6 +1654,17 @@ Finish:
 		ext4_trans_stop(mp);
 
 	EXT4_MP_UNLOCK(mp);
+	return r;
+}
+
+/* Drops the walk cache on both sides, as ext4_frename does. */
+int ext4_fremove(const char *path)
+{
+	int r;
+
+	ext4_dir_cache_drop();
+	r = __ext4_fremove(path);
+	ext4_dir_cache_drop();
 	return r;
 }
 
@@ -2952,7 +3048,7 @@ int ext4_removexattr(const char *path, const char *name, size_t name_len)
 
 /*********************************DIRECTORY OPERATION************************/
 
-int ext4_dir_rm(const char *path)
+static int __ext4_dir_rm(const char *path)
 {
 	int r;
 	int len;
@@ -3191,6 +3287,17 @@ End:
 	ext4_block_cache_write_back(mp->fs.bdev, 0);
 	EXT4_MP_UNLOCK(mp);
 
+	return r;
+}
+
+/* Drops the walk cache on both sides, as ext4_frename does. */
+int ext4_dir_rm(const char *path)
+{
+	int r;
+
+	ext4_dir_cache_drop();
+	r = __ext4_dir_rm(path);
+	ext4_dir_cache_drop();
 	return r;
 }
 

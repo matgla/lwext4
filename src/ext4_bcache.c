@@ -67,6 +67,107 @@ RB_GENERATE_INTERNAL(ext4_buf_lba, ext4_buf, lba_node,
 RB_GENERATE_INTERNAL(ext4_buf_lru, ext4_buf, lru_node,
 		     ext4_bcache_lru_compare, static inline)
 
+#if CONFIG_BLOCK_DEV_CACHE_IDLE_BUDGET
+/* Every live bcache, so the idle budget can be enforced across volumes. The
+ * LRU ids come from one counter for the same reason: they order bufs of
+ * different caches against each other. */
+static struct ext4_bcache *idle_caches[CONFIG_EXT4_MOUNTPOINTS_COUNT + 1];
+static uint32_t idle_total;
+static uint32_t idle_lru_ctr;
+
+static uint32_t ext4_bcache_next_lru_id(struct ext4_bcache *bc)
+{
+	(void)bc;
+	return ++idle_lru_ctr;
+}
+
+static void ext4_bcache_register(struct ext4_bcache *bc)
+{
+	size_t i;
+	for (i = 0; i < sizeof(idle_caches) / sizeof(idle_caches[0]); i++) {
+		if (!idle_caches[i]) {
+			idle_caches[i] = bc;
+			return;
+		}
+	}
+	/* Untracked: this cache keeps its own CONFIG_BLOCK_DEV_CACHE_SIZE. */
+}
+
+static void ext4_bcache_unregister(struct ext4_bcache *bc)
+{
+	size_t i;
+	for (i = 0; i < sizeof(idle_caches) / sizeof(idle_caches[0]); i++) {
+		if (idle_caches[i] == bc)
+			idle_caches[i] = NULL;
+	}
+}
+
+static void ext4_bcache_idle_add(struct ext4_bcache *bc, int32_t delta)
+{
+	size_t i;
+	for (i = 0; i < sizeof(idle_caches) / sizeof(idle_caches[0]); i++) {
+		if (idle_caches[i] == bc) {
+			idle_total += delta;
+			break;
+		}
+	}
+	bc->idle_blocks += delta;
+}
+
+/* Drop clean unreferenced bufs, globally least recently used first, until the
+ * idle total fits the budget. A dirty buf (write-back caching) is left to its
+ * own cache's flush, and a cache in the middle of shaking or of an end_write
+ * callback is left alone. */
+static void ext4_bcache_trim_idle(void)
+{
+	while (idle_total > CONFIG_BLOCK_DEV_CACHE_IDLE_BUDGET) {
+		struct ext4_bcache *victim_bc = NULL;
+		struct ext4_buf *victim = NULL;
+		size_t i;
+		for (i = 0; i < sizeof(idle_caches) / sizeof(idle_caches[0]); i++) {
+			struct ext4_bcache *bc = idle_caches[i];
+			struct ext4_buf *buf;
+			if (!bc || bc->dont_shake)
+				continue;
+			RB_FOREACH(buf, ext4_buf_lru, &bc->lru_root) {
+				if (ext4_bcache_test_flag(buf, BC_DIRTY))
+					continue;
+				if (!victim || buf->lru_id < victim->lru_id) {
+					victim = buf;
+					victim_bc = bc;
+				}
+				break;
+			}
+		}
+		if (!victim)
+			return;
+		ext4_bcache_drop_buf(victim_bc, victim);
+	}
+}
+
+uint32_t ext4_bcache_idle_total(void)
+{
+	return idle_total;
+}
+#else
+uint32_t ext4_bcache_idle_total(void)
+{
+	return 0;
+}
+
+static uint32_t ext4_bcache_next_lru_id(struct ext4_bcache *bc)
+{
+	return ++bc->lru_ctr;
+}
+static void ext4_bcache_register(struct ext4_bcache *bc) { (void)bc; }
+static void ext4_bcache_unregister(struct ext4_bcache *bc) { (void)bc; }
+static void ext4_bcache_idle_add(struct ext4_bcache *bc, int32_t delta)
+{
+	bc->idle_blocks += delta;
+}
+static void ext4_bcache_trim_idle(void) {}
+#endif
+
 int ext4_bcache_init_dynamic(struct ext4_bcache *bc, uint32_t cnt,
 			     uint32_t itemsize)
 {
@@ -78,6 +179,7 @@ int ext4_bcache_init_dynamic(struct ext4_bcache *bc, uint32_t cnt,
 	bc->itemsize = itemsize;
 	bc->ref_blocks = 0;
 	bc->max_ref_blocks = 0;
+	ext4_bcache_register(bc);
 
 	return EOK;
 }
@@ -93,6 +195,7 @@ void ext4_bcache_cleanup(struct ext4_bcache *bc)
 
 int ext4_bcache_fini_dynamic(struct ext4_bcache *bc)
 {
+	ext4_bcache_unregister(bc);
 	memset(bc, 0, sizeof(struct ext4_bcache));
 	return EOK;
 }
@@ -165,8 +268,10 @@ void ext4_bcache_drop_buf(struct ext4_bcache *bc, struct ext4_buf *buf)
 		ext4_dbg(DEBUG_BCACHE, DBG_WARN "Buffer is still referenced. "
 				"lba: %" PRIu64 ", refctr: %" PRIu32 "\n",
 				buf->lba, buf->refctr);
-	} else
+	} else {
 		RB_REMOVE(ext4_buf_lru, &bc->lru_root, buf);
+		ext4_bcache_idle_add(bc, -1);
+	}
 
 	RB_REMOVE(ext4_buf_lba, &bc->lba_root, buf);
 
@@ -215,8 +320,9 @@ ext4_bcache_find_get(struct ext4_bcache *bc, struct ext4_block *b,
 		if (!buf->refctr) {
 			/* Assign new value to LRU id and increment LRU counter
 			 * by 1*/
-			buf->lru_id = ++bc->lru_ctr;
+			buf->lru_id = ext4_bcache_next_lru_id(bc);
 			RB_REMOVE(ext4_buf_lru, &bc->lru_root, buf);
+			ext4_bcache_idle_add(bc, -1);
 			if (ext4_bcache_test_flag(buf, BC_DIRTY))
 				ext4_bcache_remove_dirty_node(bc, buf);
 
@@ -258,7 +364,7 @@ int ext4_bcache_alloc(struct ext4_bcache *bc, struct ext4_block *b,
 	ext4_bcache_inc_ref(buf);
 	/* Assign new value to LRU id and increment LRU counter
 	 * by 1*/
-	buf->lru_id = ++bc->lru_ctr;
+	buf->lru_id = ext4_bcache_next_lru_id(bc);
 
 	b->buf = buf;
 	b->data = buf->data;
@@ -288,6 +394,7 @@ int ext4_bcache_free(struct ext4_bcache *bc, struct ext4_block *b)
 	/* We are the last one touching this buffer, do the cleanups. */
 	if (!buf->refctr) {
 		RB_INSERT(ext4_buf_lru, &bc->lru_root, buf);
+		ext4_bcache_idle_add(bc, 1);
 		/* This buffer is ready to be flushed. */
 		if (ext4_bcache_test_flag(buf, BC_DIRTY) &&
 		    ext4_bcache_test_flag(buf, BC_UPTODATE)) {
@@ -311,6 +418,7 @@ int ext4_bcache_free(struct ext4_bcache *bc, struct ext4_block *b)
 	b->lb_id = 0;
 	b->data = 0;
 
+	ext4_bcache_trim_idle();
 	return EOK;
 }
 

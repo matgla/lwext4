@@ -457,8 +457,14 @@ int ext4_dir_find_entry(struct ext4_dir_search_result *result,
 	result->dentry = NULL;
 
 #if CONFIG_DIR_INDEX_ENABLE
+	/* "." and ".." are real entries at the start of an indexed directory's
+	   first block, which the index does not cover: the linear search finds
+	   them there straight away. */
+	bool dot = (name_len == 1 && name[0] == '.') ||
+		   (name_len == 2 && name[0] == '.' && name[1] == '.');
+
 	/* Index search */
-	if ((ext4_sb_feature_com(sb, EXT4_FCOM_DIR_INDEX)) &&
+	if (!dot && (ext4_sb_feature_com(sb, EXT4_FCOM_DIR_INDEX)) &&
 	    (ext4_inode_has_flag(parent->inode, EXT4_INODE_FLAG_INDEX))) {
 		r = ext4_dir_dx_find_entry(result, parent, name_len, name);
 		/* Check if index is not corrupted */

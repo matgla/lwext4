@@ -128,6 +128,15 @@ extern "C" {
 #define CONFIG_BLOCK_DEV_CACHE_SIZE 8
 #endif
 
+/**@brief   Unreferenced blocks kept cached across all mounted volumes
+ *          together; 0 keeps upstream behaviour (each volume keeps up to
+ *          CONFIG_BLOCK_DEV_CACHE_SIZE). With a budget, blocks nobody
+ *          references are dropped, least recently used first whichever
+ *          volume holds them, until the total fits.*/
+#ifndef CONFIG_BLOCK_DEV_CACHE_IDLE_BUDGET
+#define CONFIG_BLOCK_DEV_CACHE_IDLE_BUDGET 0
+#endif
+
 
 /**@brief   Maximum block device name*/
 #ifndef CONFIG_EXT4_MAX_BLOCKDEV_NAME

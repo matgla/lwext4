@@ -144,6 +144,9 @@ struct ext4_bcache {
 	/**@brief   A tree holding unreferenced bufs*/
 	RB_HEAD(ext4_buf_lru, ext4_buf) lru_root;
 
+	/**@brief   Bufs in lru_root (CONFIG_BLOCK_DEV_CACHE_IDLE_BUDGET)*/
+	uint32_t idle_blocks;
+
 	/**@brief   A singly-linked list holding dirty buffers*/
 	SLIST_HEAD(ext4_buf_dirty, ext4_buf) dirty_list;
 };
@@ -228,6 +231,10 @@ void ext4_bcache_cleanup(struct ext4_bcache *bc);
  * @param   bc block cache descriptor
  * @return  standard error code*/
 int ext4_bcache_fini_dynamic(struct ext4_bcache *bc);
+
+/**@brief   Unreferenced blocks cached across all tracked caches (always 0
+ *          without CONFIG_BLOCK_DEV_CACHE_IDLE_BUDGET).*/
+uint32_t ext4_bcache_idle_total(void);
 
 /**@brief   Get a buffer with the lowest LRU counter in bcache.
  * @param   bc block cache descriptor

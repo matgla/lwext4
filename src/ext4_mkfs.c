@@ -314,17 +314,16 @@ static int write_bgroup_block(struct ext4_blockdev *bd,
 
 	uint32_t block_size = ext4_sb_get_block_size(aux_info->sb);
 
+	/* The table and its backups live only in the groups that carry a
+	 * superblock. Every group used to get a copy -- into blocks its bitmap
+	 * leaves free -- which made formatting quadratic in the group count:
+	 * half a million single-block writes on a 32 GiB volume. */
 	for (j = 0; j < aux_info->groups; j++) {
+		if (!has_superblock(info, j))
+			continue;
+
 		uint64_t bg_start_block = aux_info->first_data_block +
-					  j * info->blocks_per_group;
-		uint32_t blk_off = 0;
-
-		blk_off += aux_info->bg_desc_blocks;
-		if (has_superblock(info, j)) {
-			bg_start_block++;
-			blk_off += info->bg_desc_reserve_blocks;
-		}
-
+					  j * info->blocks_per_group + 1;
 		uint64_t dsc_blk = bg_start_block + blk;
 
 		r = ext4_block_get_noread(bd, &b, dsc_blk);
@@ -342,12 +341,32 @@ static int write_bgroup_block(struct ext4_blockdev *bd,
 	return r;
 }
 
+/* Zero *count* blocks from *first* in writes of up to *zero_blocks* blocks,
+ * past the block cache: one request per run instead of one per block, which
+ * on an SD card is most of the cost of formatting. */
+static int zero_blocks(struct ext4_blockdev *bd, const void *zero,
+		       uint32_t zero_blocks, uint64_t first, uint32_t count)
+{
+	while (count) {
+		uint32_t n = count < zero_blocks ? count : zero_blocks;
+		int r = ext4_blocks_set_direct(bd, zero, first, n);
+		if (r != EOK)
+			return r;
+		first += n;
+		count -= n;
+	}
+	return EOK;
+}
+
+/* Largest zero buffer used for the inode tables: 128 sectors, the most one
+ * SD write request carries in the yasos driver. Halved until it allocates. */
+#define MKFS_ZERO_BUF_MAX (64 * 1024)
+
 static int write_bgroups(struct ext4_blockdev *bd, struct fs_aux_info *aux_info,
 			 struct ext4_mkfs_info *info)
 {
 	int r = EOK;
 
-	struct ext4_block b;
 	struct ext4_bgroup *bg_desc;
 
 	uint32_t i;
@@ -357,6 +376,15 @@ static int write_bgroups(struct ext4_blockdev *bd, struct fs_aux_info *aux_info,
 	uint32_t dsc_size = ext4_sb_get_desc_size(aux_info->sb);
 	uint32_t dsc_per_block = block_size / dsc_size;
 	uint32_t k = 0;
+
+	uint32_t table_bytes = aux_info->inode_table_blocks * block_size;
+	uint32_t zero_size = table_bytes < MKFS_ZERO_BUF_MAX ? table_bytes
+							     : MKFS_ZERO_BUF_MAX;
+	void *zero = NULL;
+	while (!(zero = ext4_calloc(1, zero_size)) && zero_size > block_size)
+		zero_size /= 2;
+	if (!zero)
+		return ENOMEM;
 
 	for (i = 0; i < aux_info->groups; i++) {
 		uint64_t bg_start_block = aux_info->first_data_block +
@@ -406,28 +434,22 @@ static int write_bgroups(struct ext4_blockdev *bd, struct fs_aux_info *aux_info,
 
 		ext4_bg_set_used_dirs_count(bg_desc, aux_info->sb, 0);
 
+		/* The bitmaps are left to ext4_mkfs's init_bgs, which writes
+		 * both whole while clearing the UNINIT flags. The inode table
+		 * is zeroed here in large writes; ITABLE_ZEROED keeps init_bgs
+		 * from zeroing it again a block at a time. */
 		ext4_bg_set_flag(bg_desc,
 				 EXT4_BLOCK_GROUP_BLOCK_UNINIT |
-				 EXT4_BLOCK_GROUP_INODE_UNINIT);
+				 EXT4_BLOCK_GROUP_INODE_UNINIT |
+				 EXT4_BLOCK_GROUP_ITABLE_ZEROED);
 
 		sb_free_blk += bg_free_blk;
 
-		r = ext4_block_get_noread(bd, &b, bg_start_block + blk_off + 1);
+		r = zero_blocks(bd, zero, zero_size / block_size,
+				bg_start_block + blk_off + 3,
+				aux_info->inode_table_blocks);
 		if (r != EOK)
-			return r;
-		memset(b.data, 0, block_size);
-		ext4_bcache_set_dirty(b.buf);
-		r = ext4_block_set(bd, &b);
-		if (r != EOK)
-			return r;
-		r = ext4_block_get_noread(bd, &b, bg_start_block + blk_off + 2);
-		if (r != EOK)
-			return r;
-		memset(b.data, 0, block_size);
-		ext4_bcache_set_dirty(b.buf);
-		r = ext4_block_set(bd, &b);
-		if (r != EOK)
-			return r;
+			goto Finish;
 
 		if (++k != dsc_per_block)
 			continue;
@@ -435,15 +457,17 @@ static int write_bgroups(struct ext4_blockdev *bd, struct fs_aux_info *aux_info,
 		k = 0;
 		r = write_bgroup_block(bd, aux_info, info, i / dsc_per_block);
 		if (r != EOK)
-			return r;
+			goto Finish;
 
 	}
 
 	r = write_bgroup_block(bd, aux_info, info, i / dsc_per_block);
 	if (r != EOK)
-		return r;
+		goto Finish;
 
 	ext4_sb_set_free_blocks_cnt(aux_info->sb, sb_free_blk);
+Finish:
+	ext4_free(zero);
 	return r;
 }
 
