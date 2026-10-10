@@ -454,7 +454,7 @@ int ext4_mount(const char *dev_name, const char *mount_point,
 	ext4_block_set_lb_size(bd, bsize);
 	bc = &mp->bc;
 
-	r = ext4_bcache_init_dynamic(bc, CONFIG_BLOCK_DEV_CACHE_SIZE, bsize);
+	r = ext4_bcache_init_dynamic(bc, ext4_bcache_size_limit(), bsize);
 	if (r != EOK) {
 		ext4_block_fini(bd);
 		return r;

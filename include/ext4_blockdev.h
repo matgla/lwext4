@@ -43,6 +43,23 @@ extern "C" {
 #include <ext4_config.h>
 #include <ext4_bcache.h>
 
+/* Values are physical sectors, except HIT/MISS and READ_REQUEST (counts).
+ * CACHED_SECTORS is the subset of READ_SECTORS fetched by block_get;
+ * direct data, byte reads and device probes make up the remainder. */
+enum ext4_block_stats_event {
+	EXT4_STATS_CACHE_HIT,
+	EXT4_STATS_CACHE_MISS,
+	EXT4_STATS_READ_REQUEST,
+	EXT4_STATS_READ_SECTORS,
+	EXT4_STATS_CACHED_SECTORS
+};
+#if CONFIG_BLOCK_DEV_ENABLE_STATS && CONFIG_BLOCK_DEV_STATS_HOOK
+void ext4_user_block_stats(unsigned event, uint32_t value);
+#define EXT4_BLOCK_STATS(event, value) ext4_user_block_stats(event, value)
+#else
+#define EXT4_BLOCK_STATS(event, value) ((void)0)
+#endif
+
 #include <stdbool.h>
 #include <stdint.h>
 

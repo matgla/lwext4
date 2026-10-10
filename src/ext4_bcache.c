@@ -67,6 +67,30 @@ RB_GENERATE_INTERNAL(ext4_buf_lba, ext4_buf, lba_node,
 RB_GENERATE_INTERNAL(ext4_buf_lru, ext4_buf, lru_node,
 		     ext4_bcache_lru_compare, static inline)
 
+/* yasos: the build-time sizes are the floor; the user may raise them at run
+ * time, before mounting, once it knows how much memory the cache can have. */
+static uint32_t bcache_size_limit = CONFIG_BLOCK_DEV_CACHE_SIZE;
+#if CONFIG_BLOCK_DEV_CACHE_IDLE_BUDGET
+static uint32_t idle_budget = CONFIG_BLOCK_DEV_CACHE_IDLE_BUDGET;
+#endif
+
+void ext4_bcache_set_limits(uint32_t cache_size, uint32_t budget)
+{
+	bcache_size_limit = cache_size > CONFIG_BLOCK_DEV_CACHE_SIZE
+				    ? cache_size : CONFIG_BLOCK_DEV_CACHE_SIZE;
+#if CONFIG_BLOCK_DEV_CACHE_IDLE_BUDGET
+	idle_budget = budget > CONFIG_BLOCK_DEV_CACHE_IDLE_BUDGET
+			      ? budget : CONFIG_BLOCK_DEV_CACHE_IDLE_BUDGET;
+#else
+	(void)budget;
+#endif
+}
+
+uint32_t ext4_bcache_size_limit(void)
+{
+	return bcache_size_limit;
+}
+
 #if CONFIG_BLOCK_DEV_CACHE_IDLE_BUDGET
 /* Every live bcache, so the idle budget can be enforced across volumes. The
  * LRU ids come from one counter for the same reason: they order bufs of
@@ -120,7 +144,7 @@ static void ext4_bcache_idle_add(struct ext4_bcache *bc, int32_t delta)
  * callback is left alone. */
 static void ext4_bcache_trim_idle(void)
 {
-	while (idle_total > CONFIG_BLOCK_DEV_CACHE_IDLE_BUDGET) {
+	while (idle_total > idle_budget) {
 		struct ext4_bcache *victim_bc = NULL;
 		struct ext4_buf *victim = NULL;
 		size_t i;
@@ -219,6 +243,33 @@ int ext4_bcache_fini_dynamic(struct ext4_bcache *bc)
  *  referenced.
  */
 
+#if CONFIG_BLOCK_DEV_CACHE_USER_ALLOC
+/* yasos: descriptor and data in one piece from the user's allocator, which
+ * can put the whole cache somewhere other than the general heap. The data
+ * starts 16-byte aligned behind the descriptor. */
+#define EXT4_BUF_DESC_SIZE ((sizeof(struct ext4_buf) + 15) & ~(size_t)15)
+
+static struct ext4_buf *
+ext4_buf_alloc(struct ext4_bcache *bc, uint64_t lba)
+{
+	struct ext4_buf *buf;
+	uint8_t *mem = ext4_user_bcache_alloc(EXT4_BUF_DESC_SIZE + bc->itemsize);
+	if (!mem)
+		return NULL;
+
+	buf = (struct ext4_buf *)mem;
+	memset(buf, 0, sizeof(struct ext4_buf));
+	buf->lba = lba;
+	buf->data = mem + EXT4_BUF_DESC_SIZE;
+	buf->bc = bc;
+	return buf;
+}
+
+static void ext4_buf_free(struct ext4_buf *buf)
+{
+	ext4_user_bcache_free(buf);
+}
+#else
 static struct ext4_buf *
 ext4_buf_alloc(struct ext4_bcache *bc, uint64_t lba)
 {
@@ -244,6 +295,18 @@ static void ext4_buf_free(struct ext4_buf *buf)
 {
 	ext4_free(buf->data);
 	ext4_free(buf);
+}
+#endif
+
+/* The first buffer at or after `lba`, NULL past the last one. */
+static struct ext4_buf *
+ext4_buf_lookup_from(struct ext4_bcache *bc, uint64_t lba)
+{
+	struct ext4_buf tmp = {
+		.lba = lba
+	};
+
+	return RB_NFIND(ext4_buf_lba, &bc->lba_root, &tmp);
 }
 
 static struct ext4_buf *
@@ -301,12 +364,38 @@ void ext4_bcache_invalidate_lba(struct ext4_bcache *bc,
 				uint32_t cnt)
 {
 	uint64_t end = from + cnt - 1;
-	struct ext4_buf *tmp = ext4_buf_lookup(bc, from), *buf;
-	RB_FOREACH_FROM(buf, ext4_buf_lba, tmp) {
-		if (buf->lba > end)
-			break;
-
+	struct ext4_buf *buf;
+	/* yasos: from the first cached block in the range, not from `from`
+	 * itself -- an exact lookup made the whole range a no-op whenever its
+	 * first block was not cached, leaving a freed block's dirty copy to be
+	 * flushed over whatever the block holds next. */
+	for (buf = ext4_buf_lookup_from(bc, from);
+	     buf && buf->lba <= end;
+	     buf = RB_NEXT(ext4_buf_lba, &bc->lba_root, buf))
 		ext4_bcache_invalidate_buf(bc, buf);
+}
+
+void ext4_bcache_direct_io(struct ext4_bcache *bc, uint8_t *buf,
+			   uint64_t start, uint64_t end, bool write)
+{
+	uint64_t bsize = bc->itemsize;
+	struct ext4_buf *b;
+
+	for (b = ext4_buf_lookup_from(bc, start / bsize);
+	     b && b->lba * bsize < end;
+	     b = RB_NEXT(ext4_buf_lba, &bc->lba_root, b)) {
+		uint64_t b_start = b->lba * bsize;
+		uint64_t from = b_start > start ? b_start : start;
+		uint64_t to = b_start + bsize < end ? b_start + bsize : end;
+		uint8_t *cached = b->data + (from - b_start);
+		uint8_t *device = buf + (from - start);
+
+		if (!ext4_bcache_test_flag(b, BC_UPTODATE) || cached == device)
+			continue;
+		if (write)
+			memcpy(cached, device, (size_t)(to - from));
+		else if (ext4_bcache_test_flag(b, BC_DIRTY))
+			memcpy(device, cached, (size_t)(to - from));
 	}
 }
 

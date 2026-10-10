@@ -65,13 +65,44 @@ static void ext4_bdif_unlock(struct ext4_blockdev *bdev)
 	ext4_assert(r == EOK);
 }
 
+/* yasos: every device transfer passes the block cache's coherency check.
+ * File data (ext4_fread/ext4_fwrite, the byte helpers) goes straight to the
+ * device, metadata through the cache, and a block can be both: a freed
+ * directory or extent block handed to a file, a slow symlink read back with
+ * ext4_fread. With write-back held across calls the cached copy may be dirty
+ * and newer than the device -- or older, about to be flushed over data
+ * written past it. */
+static void ext4_bdif_coherent(struct ext4_blockdev *bdev, const void *buf,
+			       uint64_t blk_id, uint32_t blk_cnt, bool write)
+{
+	uint8_t *p = (uint8_t *)buf;
+	uint64_t start = blk_id * bdev->bdif->ph_bsize;
+	uint64_t end = start + (uint64_t)blk_cnt * bdev->bdif->ph_bsize;
+
+	if (!bdev->bc || !bdev->bc->itemsize || RB_EMPTY(&bdev->bc->lba_root))
+		return;
+	if (end <= bdev->part_offset)
+		return;
+	if (start < bdev->part_offset) {
+		p += bdev->part_offset - start;
+		start = bdev->part_offset;
+	}
+	ext4_bcache_direct_io(bdev->bc, p, start - bdev->part_offset,
+			      end - bdev->part_offset, write);
+}
+
 static int ext4_bdif_bread(struct ext4_blockdev *bdev, void *buf,
 			   uint64_t blk_id, uint32_t blk_cnt)
 {
 	ext4_bdif_lock(bdev);
 	int r = bdev->bdif->bread(bdev, buf, blk_id, blk_cnt);
+	EXT4_BLOCK_STATS(EXT4_STATS_READ_REQUEST, 1);
+	if (r == EOK)
+		EXT4_BLOCK_STATS(EXT4_STATS_READ_SECTORS, blk_cnt);
 	bdev->bdif->bread_ctr++;
 	ext4_bdif_unlock(bdev);
+	if (r == EOK)
+		ext4_bdif_coherent(bdev, buf, blk_id, blk_cnt, false);
 	return r;
 }
 
@@ -82,6 +113,8 @@ static int ext4_bdif_bwrite(struct ext4_blockdev *bdev, const void *buf,
 	int r = bdev->bdif->bwrite(bdev, buf, blk_id, blk_cnt);
 	bdev->bdif->bwrite_ctr++;
 	ext4_bdif_unlock(bdev);
+	if (r == EOK)
+		ext4_bdif_coherent(bdev, buf, blk_id, blk_cnt, true);
 	return r;
 }
 
@@ -249,11 +282,13 @@ int ext4_block_get(struct ext4_blockdev *bdev, struct ext4_block *b,
 		return r;
 
 	if (ext4_bcache_test_flag(b->buf, BC_UPTODATE)) {
+		EXT4_BLOCK_STATS(EXT4_STATS_CACHE_HIT, 1);
 		/* Data in the cache is up-to-date.
 		 * Reading from physical device is not required */
 		return EOK;
 	}
 
+	EXT4_BLOCK_STATS(EXT4_STATS_CACHE_MISS, 1);
 	r = ext4_blocks_get_direct(bdev, b->data, lba, 1);
 	if (r != EOK) {
 		ext4_bcache_free(bdev->bc, b);
@@ -264,6 +299,8 @@ int ext4_block_get(struct ext4_blockdev *bdev, struct ext4_block *b,
 	/* Mark buffer up-to-date, since
 	 * fresh data is read from physical device just now. */
 	ext4_bcache_set_flag(b->buf, BC_UPTODATE);
+	EXT4_BLOCK_STATS(EXT4_STATS_CACHED_SECTORS,
+			 bdev->lg_bsize / bdev->bdif->ph_bsize);
 	return EOK;
 }
 

@@ -43,6 +43,7 @@ extern "C" {
 
 #include <ext4_config.h>
 
+#include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <misc/tree.h>
@@ -259,6 +260,36 @@ void ext4_bcache_invalidate_buf(struct ext4_bcache *bc,
 void ext4_bcache_invalidate_lba(struct ext4_bcache *bc,
 				uint64_t from,
 				uint32_t cnt);
+
+/**@brief   Keep device I/O that bypasses the cache coherent with it (yasos).
+ *          After a read, dirty cached blocks overlapping it replace what the
+ *          device returned; after a write, the written bytes refresh every
+ *          cached copy, so a later flush cannot write older bytes back.
+ *          A cached block whose buffer *is* the I/O buffer (the cache's own
+ *          fill or flush) is left alone.
+ * @param   bc block cache descriptor
+ * @param   buf the I/O buffer; it starts at byte `start`
+ * @param   start first byte of the I/O (partition relative)
+ * @param   end one past its last byte
+ * @param   write whether the I/O was a write*/
+void ext4_bcache_direct_io(struct ext4_bcache *bc, uint8_t *buf,
+			   uint64_t start, uint64_t end, bool write);
+
+/**@brief   Raise the block cache sizes above their build-time floor
+ *          (CONFIG_BLOCK_DEV_CACHE_SIZE blocks per volume,
+ *          CONFIG_BLOCK_DEV_CACHE_IDLE_BUDGET unreferenced blocks across all
+ *          volumes). Volumes mounted afterwards use the new size (yasos).*/
+void ext4_bcache_set_limits(uint32_t cache_size, uint32_t idle_budget);
+
+/**@brief   Blocks a newly mounted volume's cache may hold.*/
+uint32_t ext4_bcache_size_limit(void);
+
+#if CONFIG_BLOCK_DEV_CACHE_USER_ALLOC
+/**@brief   Memory for one cache buffer, descriptor and data together
+ *          (CONFIG_BLOCK_DEV_CACHE_USER_ALLOC); provided by the user.*/
+void *ext4_user_bcache_alloc(size_t size);
+void ext4_user_bcache_free(void *ptr);
+#endif
 
 /**@brief   Find existing buffer from block cache memory.
  *          Unreferenced block allocation is based on LRU

@@ -123,6 +123,11 @@ extern "C" {
 #define CONFIG_BLOCK_DEV_ENABLE_STATS 1
 #endif
 
+/* Optional aggregate profiling hook supplied by the embedding system. */
+#ifndef CONFIG_BLOCK_DEV_STATS_HOOK
+#define CONFIG_BLOCK_DEV_STATS_HOOK 0
+#endif
+
 /**@brief   Cache size of block device.*/
 #ifndef CONFIG_BLOCK_DEV_CACHE_SIZE
 #define CONFIG_BLOCK_DEV_CACHE_SIZE 8
@@ -180,6 +185,13 @@ extern "C" {
  *        from standard library to user provided*/
 #ifndef CONFIG_USE_USER_MALLOC
 #define CONFIG_USE_USER_MALLOC 0
+#endif
+
+/**@brief   Block cache buffers (descriptor and data in one allocation) come
+ *          from ext4_user_bcache_alloc/ext4_user_bcache_free instead of the
+ *          malloc family*/
+#ifndef CONFIG_BLOCK_DEV_CACHE_USER_ALLOC
+#define CONFIG_BLOCK_DEV_CACHE_USER_ALLOC 0
 #endif
 
 #ifdef __cplusplus
