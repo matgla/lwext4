@@ -139,6 +139,18 @@ int ext4_device_unregister(const char *dev_name);
  * @return  Standard error code.*/
 int ext4_device_unregister_all(void);
 
+#if CONFIG_EXT4_EXTERNAL_MOUNT_TABLE
+/**@brief   Bytes of zeroed memory ext4_mount_table_set wants.*/
+size_t ext4_mount_table_size(void);
+
+/**@brief   Where the mount points live: before any other call, and for good.
+ * @param   table of ext4_mount_table_size() zeroed bytes */
+void ext4_mount_table_set(void *table);
+
+/**@brief   Whether ext4_mount_table_set has been called.*/
+bool ext4_mount_table_is_set(void);
+#endif
+
 /**@brief   Mount a block device with EXT4 partition to the mount point.
  *
  * @param   dev_name Block device name (@ref ext4_device_register).

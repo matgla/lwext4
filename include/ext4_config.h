@@ -160,6 +160,11 @@ extern "C" {
 #endif
 
 /**@brief   Maximum mountpoint count*/
+/**@brief   The mount table comes from ext4_mount_table_set, not static data.*/
+#ifndef CONFIG_EXT4_EXTERNAL_MOUNT_TABLE
+#define CONFIG_EXT4_EXTERNAL_MOUNT_TABLE 0
+#endif
+
 #ifndef CONFIG_EXT4_MOUNTPOINTS_COUNT
 #define CONFIG_EXT4_MOUNTPOINTS_COUNT 2
 #endif

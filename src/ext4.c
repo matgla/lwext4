@@ -110,7 +110,30 @@ struct ext4_block_devices {
 static struct ext4_block_devices s_bdevices[CONFIG_EXT4_BLOCKDEVS_COUNT];
 
 /**@brief   Mountpoints.*/
+#if CONFIG_EXT4_EXTERNAL_MOUNT_TABLE
+/* Given by the caller (ext4_mount_table_set), who may not want 2 KB per mount
+ * point in its fastest memory. Nothing here needs to be atomic. */
+static struct ext4_mountpoint *s_mp;
+#define MOUNT_TABLE_MISSING (!s_mp)
+
+size_t ext4_mount_table_size(void)
+{
+	return sizeof(struct ext4_mountpoint) * CONFIG_EXT4_MOUNTPOINTS_COUNT;
+}
+
+void ext4_mount_table_set(void *table)
+{
+	s_mp = table;
+}
+
+bool ext4_mount_table_is_set(void)
+{
+	return s_mp != NULL;
+}
+#else
 static struct ext4_mountpoint s_mp[CONFIG_EXT4_MOUNTPOINTS_COUNT];
+#define MOUNT_TABLE_MISSING 0
+#endif
 
 static void ext4_dir_cache_drop(void);
 
@@ -426,6 +449,9 @@ int ext4_mount(const char *dev_name, const char *mount_point,
 	if (!bd)
 		return ENODEV;
 
+	if (MOUNT_TABLE_MISSING)
+		return ENOMEM;
+
 	for (size_t i = 0; i < CONFIG_EXT4_MOUNTPOINTS_COUNT; ++i) {
 		if (!s_mp[i].mounted) {
 			strcpy(s_mp[i].name, mount_point);
@@ -486,6 +512,9 @@ int ext4_umount(const char *mount_point)
 
 	ext4_dir_cache_drop();
 
+	if (MOUNT_TABLE_MISSING)
+		return ENODEV;
+
 	for (i = 0; i < CONFIG_EXT4_MOUNTPOINTS_COUNT; ++i) {
 		if (!strcmp(s_mp[i].name, mount_point)) {
 			mp = &s_mp[i];
@@ -513,6 +542,9 @@ Finish:
 
 static struct ext4_mountpoint *ext4_get_mount(const char *path)
 {
+	if (MOUNT_TABLE_MISSING)
+		return NULL;
+
 	for (size_t i = 0; i < CONFIG_EXT4_MOUNTPOINTS_COUNT; ++i) {
 
 		if (!s_mp[i].mounted)
@@ -780,6 +812,9 @@ int ext4_mount_setup_locks(const char *mount_point,
 	uint32_t i;
 	struct ext4_mountpoint *mp = 0;
 
+	if (MOUNT_TABLE_MISSING)
+		return ENOENT;
+
 	for (i = 0; i < CONFIG_EXT4_MOUNTPOINTS_COUNT; ++i) {
 		if (!strcmp(s_mp[i].name, mount_point)) {
 			mp = &s_mp[i];
@@ -1013,6 +1048,50 @@ static uint32_t ext4_dir_cache_match(struct ext4_mountpoint *mp,
  * NOTICE: if filetype is equal to EXT4_DIRENTRY_UNKNOWN,
  * any filetype of the target dir entry will be accepted.
  */
+/* yasos: out of line so a lookup, by far the common and deep case, does not carry
+ * this inode_ref in its frame down through the directory and block layers. */
+static __attribute__((noinline)) int
+ext4_open_create_entry(struct ext4_mountpoint *mp, struct ext4_inode_ref *parent,
+		       const char *path, int len, int ftype)
+{
+	struct ext4_inode_ref child_ref;
+	int r = ext4_fs_alloc_inode(&mp->fs, &child_ref, ftype);
+
+	if (r != EOK)
+		return r;
+
+	ext4_fs_inode_blocks_init(&mp->fs, &child_ref);
+
+	/*Link with root dir.*/
+	r = ext4_link(mp, parent, &child_ref, path, len, false);
+	if (r != EOK) {
+		/*Fail. Free new inode.*/
+		ext4_fs_free_inode(&child_ref);
+		/*We do not want to write new inode.
+		  But block has to be released.*/
+		child_ref.dirty = false;
+		ext4_fs_put_inode_ref(&child_ref);
+		return r;
+	}
+
+	ext4_fs_put_inode_ref(&child_ref);
+	return EOK;
+}
+
+static __attribute__((noinline)) int
+ext4_open_inode_type(struct ext4_fs *fs, uint32_t inode, uint32_t *imode)
+{
+	struct ext4_inode_ref child_ref;
+	int r = ext4_fs_get_inode_ref(fs, inode, &child_ref);
+
+	if (r != EOK)
+		return r;
+
+	*imode = ext4_inode_type(&fs->sb, child_ref.inode);
+	ext4_fs_put_inode_ref(&child_ref);
+	return EOK;
+}
+
 static int ext4_generic_open2(ext4_file *f, const char *path, int flags,
 			      int ftype, uint32_t *parent_inode,
 			      uint32_t *name_off)
@@ -1090,28 +1169,10 @@ static int ext4_generic_open2(ext4_file *f, const char *path, int flags,
 				break;
 
 			/*O_CREAT allows create new entry*/
-			struct ext4_inode_ref child_ref;
-			r = ext4_fs_alloc_inode(fs, &child_ref,
-					is_goal ? ftype : EXT4_DE_DIR);
-
+			r = ext4_open_create_entry(mp, &ref, path, len,
+						   is_goal ? ftype : EXT4_DE_DIR);
 			if (r != EOK)
 				break;
-
-			ext4_fs_inode_blocks_init(fs, &child_ref);
-
-			/*Link with root dir.*/
-			r = ext4_link(mp, &ref, &child_ref, path, len, false);
-			if (r != EOK) {
-				/*Fail. Free new inode.*/
-				ext4_fs_free_inode(&child_ref);
-				/*We do not want to write new inode.
-				  But block has to be released.*/
-				child_ref.dirty = false;
-				ext4_fs_put_inode_ref(&child_ref);
-				break;
-			}
-
-			ext4_fs_put_inode_ref(&child_ref);
 			continue;
 		}
 
@@ -1124,13 +1185,9 @@ static int ext4_generic_open2(ext4_file *f, const char *path, int flags,
 			t = ext4_dir_en_get_inode_type(sb, result.dentry);
 			imode = ext4_fs_correspond_inode_mode(t);
 		} else {
-			struct ext4_inode_ref child_ref;
-			r = ext4_fs_get_inode_ref(fs, next_inode, &child_ref);
+			r = ext4_open_inode_type(fs, next_inode, &imode);
 			if (r != EOK)
 				break;
-
-			imode = ext4_inode_type(sb, child_ref.inode);
-			ext4_fs_put_inode_ref(&child_ref);
 		}
 
 		r = ext4_dir_destroy_result(&ref, &result);

@@ -299,24 +299,33 @@ static void ext4_buf_free(struct ext4_buf *buf)
 #endif
 
 /* The first buffer at or after `lba`, NULL past the last one. */
+/* yasos: both lookups walk the tree by hand. RB_FIND wants a whole ext4_buf on
+ * the stack as its key, and this is the deepest frame of a path lookup. */
 static struct ext4_buf *
 ext4_buf_lookup_from(struct ext4_bcache *bc, uint64_t lba)
 {
-	struct ext4_buf tmp = {
-		.lba = lba
-	};
+	struct ext4_buf *node = RB_ROOT(&bc->lba_root);
+	struct ext4_buf *above = NULL;
 
-	return RB_NFIND(ext4_buf_lba, &bc->lba_root, &tmp);
+	while (node) {
+		if (lba < node->lba) {
+			above = node;
+			node = RB_LEFT(node, lba_node);
+		} else if (lba > node->lba) {
+			node = RB_RIGHT(node, lba_node);
+		} else {
+			return node;
+		}
+	}
+	return above;
 }
 
 static struct ext4_buf *
 ext4_buf_lookup(struct ext4_bcache *bc, uint64_t lba)
 {
-	struct ext4_buf tmp = {
-		.lba = lba
-	};
+	struct ext4_buf *node = ext4_buf_lookup_from(bc, lba);
 
-	return RB_FIND(ext4_buf_lba, &bc->lba_root, &tmp);
+	return node && node->lba == lba ? node : NULL;
 }
 
 struct ext4_buf *ext4_buf_lowest_lru(struct ext4_bcache *bc)
