@@ -893,6 +893,11 @@ int ext4_mkfs(struct ext4_fs *fs, struct ext4_blockdev *bd,
 	 * mkfs leaked the whole cache (CONFIG_BLOCK_DEV_CACHE_SIZE blocks). */
 	ext4_bcache_cleanup(&bc);
 	ext4_bcache_fini_dynamic(&bc);
+	/* bc dies with this frame: unbind it. Every read and write checks
+	 * bd->bc for coherency (ext4_bdif_coherent), so a mount of the new
+	 * filesystem -- its superblock read comes before it binds its own
+	 * cache -- would walk a dead stack frame's "tree". */
+	bd->bc = NULL;
 
 	block_fini:
 	ext4_block_fini(bd);
